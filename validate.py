@@ -18,6 +18,12 @@ Stages (each reported PASS/FAIL; the run fails if any stage fails):
      the portfolio pre-push scanner (path assembled at runtime so this
      file carries no self-matching literal). Internal build records
      (BUILD_LOG.md, BUILD_REPORT.md) are not shipped and not scanned.
+     The scanner is a portfolio-internal tool that lives only on the
+     author's machine by design (it embodies the patterns it scans for,
+     so it cannot be shipped inside the tree it scans). On any other
+     machine — e.g. a CI runner — the stage reports SKIP instead of
+     failing: it has not graded the code at all. Where the scanner is
+     present, candidate hits fail the run exactly as before.
   7. banned-name check — the forbidden portfolio name appears nowhere in
      the shippable tree.
 
@@ -43,19 +49,33 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 os.environ.setdefault("PYTHONPATH", str(SRC))
 
-RESULTS: list[tuple[str, bool, str]] = []
+RESULTS: list[tuple[str, bool | None, str]] = []
+
+
+class _SkipStage(Exception):
+    """A stage whose precondition is absent from this machine.
+
+    Distinct from failure: the stage did not grade the code at all.
+    Used only for stage 6, whose scanner is a portfolio-internal
+    pre-push tool that lives on the author's machine by design and
+    cannot be shipped inside the tree it scans.
+    """
 
 
 def stage(name):
     def deco(fn):
-        try:
-            note = fn()
-            RESULTS.append((name, True, note or ""))
-            print(f"[PASS] {name} {note or ''}")
-        except Exception as exc:  # noqa: BLE001 — harness reports, not hides
-            RESULTS.append((name, False, str(exc)))
-            print(f"[FAIL] {name}: {exc}")
-        return fn
+        def run():
+            try:
+                note = fn()
+                RESULTS.append((name, True, note or ""))
+                print(f"[PASS] {name} {note or ''}")
+            except _SkipStage as sk:
+                RESULTS.append((name, None, str(sk)))
+                print(f"[SKIP] {name}: {sk}")
+            except Exception as exc:  # noqa: BLE001 — harness reports, not hides
+                RESULTS.append((name, False, str(exc)))
+                print(f"[FAIL] {name}: {exc}")
+        return run
     return deco
 
 
@@ -150,7 +170,10 @@ def _s5():
 def _s6():
     scanner = (Path.home() / "workspace" /
                ("github-" + "fis" + "-watch") / ("fis" + "_scan.py"))
-    assert scanner.exists(), "reference scanner not found"
+    if not scanner.exists():
+        raise _SkipStage(
+            "portfolio reference scanner not present on this machine; "
+            "the pre-push gate runs where the scanner lives")
     targets = [str(ROOT / p) for p in
                ("src", "tests", "examples", "README.md", "pyproject.toml",
                 "LICENSE", "validate.py", ".github")]
@@ -182,8 +205,13 @@ def _s7():
 
 def main() -> int:
     _s1(); _s2(); _s3(); _s4(); _s5(); _s6(); _s7()
-    ok = all(passed for _, passed, _ in RESULTS)
-    print("\nOVERALL:", "PASS" if ok else "FAIL")
+    failed = [n for n, passed, _ in RESULTS if passed is False]
+    skipped = [n for n, passed, _ in RESULTS if passed is None]
+    ok = not failed
+    verdict = "PASS" if ok else "FAIL"
+    if skipped:
+        verdict += f" ({len(skipped)} stage(s) skipped: {', '.join(skipped)})"
+    print("\nOVERALL:", verdict)
     return 0 if ok else 1
 
 
